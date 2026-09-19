@@ -16,11 +16,15 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16MoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -186,6 +190,34 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+    def test_fused_component_targets_override_generic_module_target(self):
+        # The checkpoint stores gate/up separately in an exact FP8 group while
+        # a broad Linear group supplies the INT4 default. The fused runtime
+        # module must resolve through its components before its class name.
+        fp8_gate_up_group = dict(FP8_GROUP)
+        fp8_gate_up_group["targets"] = [
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.0.mlp.up_proj",
+        ]
+        wna16_linear_group = dict(WNA16_GROUP)
+        wna16_linear_group["targets"] = ["Linear"]
+        config = _mixed_precision_config(wna16_linear_group, fp8_gate_up_group)
+        quant_config = CompressedTensorsConfig.from_config(config)
+        quant_config.packed_modules_mapping = {
+            "gate_up_proj": ["gate_proj", "up_proj"]
+        }
+        fused_linear = type("MergedColumnParallelLinear", (torch.nn.Module,), {})()
+
+        with mock.patch.object(
+            CompressedTensorsConfig, "_check_scheme_supported", return_value=True
+        ):
+            scheme = quant_config.get_linear_scheme(
+                fused_linear,
+                layer_name="model.language_model.layers.0.mlp.gate_up_proj",
+            )
+
+        self.assertIsInstance(scheme, CompressedTensorsW8A8Fp8)
 
 
 if __name__ == "__main__":

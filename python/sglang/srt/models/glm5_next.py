@@ -380,12 +380,21 @@ class Glm5NextLinearAttention(nn.Module):
                 prefix=f"{prefix}.qkv_proj",
             )
 
+            # The checkpoint nests these two under `forget_gate.` and lists them
+            # in the compressed-tensors `ignore` list under that nested name
+            # (`...self_attn.forget_gate.f_a_proj`), while the sibling
+            # g_a_proj/g_b_proj are listed unnested.  should_ignore_layer()
+            # matches on the quant prefix, so the prefix must use the
+            # checkpoint's nested name; otherwise these two miss the ignore
+            # list, get built as INT4 (weight_packed/scale/zero_point), and the
+            # checkpoint's plain bf16 `weight` silently fails to load, leaving
+            # f_a_proj/f_b_proj zero and zeroing every KDA layer's output.
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.f_a_proj",
+                prefix=f"{prefix}.forget_gate.f_a_proj",
             )
 
             self.f_b_proj = ColumnParallelLinear(
@@ -393,7 +402,7 @@ class Glm5NextLinearAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.f_b_proj",
+                prefix=f"{prefix}.forget_gate.f_b_proj",
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
@@ -1437,6 +1446,51 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = name.replace("language_model.", "")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
+            # The checkpoint nests the KDA forget-gate tensors under a
+            # `forget_gate.` submodule (A_log, dt_bias, f_a_proj.weight,
+            # f_b_proj.weight), but KDA registers them directly on the
+            # attention module.  Without this rename the names never match and
+            # the `if name not in params_dict: continue` guard below silently
+            # drops all 136 of them, leaving f_a_proj/f_b_proj zero-filled.
+            # forget_gate then evaluates to 0 in every KDA layer, so the gated
+            # delta-net output -- and therefore o_proj -- is exactly zero and
+            # roughly two thirds of the model contributes nothing.
+            if "self_attn.forget_gate." in name:
+                name = name.replace("self_attn.forget_gate.", "self_attn.")
+
+            # The checkpoint stores the multi-hyper-connection (mHC) tensors as
+            # `layers.N.attn_hc.{base,fn,scale}` / `layers.N.ffn_hc.{...}`, but
+            # the decoder layer registers them as `hc_attn_*` / `hc_ffn_*`.
+            # Without this rename none of them load, every layer's mHC residual
+            # mixing runs on zeros, and the model emits garbage even when
+            # attention itself is correct.
+            if "attn_hc." in name:
+                name = name.replace("attn_hc.", "hc_attn_")
+            if "ffn_hc." in name:
+                name = name.replace("ffn_hc.", "hc_ffn_")
+
+            # The checkpoint stores one fused causal-conv weight per KDA layer
+            # (`self_attn.conv1d.weight`, [3 * projection_size, 1, conv_size])
+            # while this module builds a MergedColumnParallelLinear
+            # `qkv_conv1d` fed by separate .q_conv1d/.k_conv1d/.v_conv1d shards
+            # that the checkpoint never provides.  Unless the fused tensor is
+            # split here the merged parameter stays zero-initialised, the causal
+            # conv output is zero, and every KDA layer's attention output
+            # collapses to zero.
+            if name.endswith("self_attn.conv1d.weight"):
+                target = name.replace(
+                    "self_attn.conv1d.weight", "self_attn.qkv_conv1d.weight"
+                )
+                if target in params_dict:
+                    param = params_dict[target]
+                    conv_loader = param.weight_loader
+                    for shard_id, shard in enumerate(
+                        torch.chunk(loaded_weight, 3, dim=0)
+                    ):
+                        conv_loader(param, shard, shard_id)
+                    weight_names.append(target)
+                    continue
+
 
             if "visual" in name:
                 name = name.replace("attn.qkv.", "attn.qkv_proj.")

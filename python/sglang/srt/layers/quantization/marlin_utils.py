@@ -410,6 +410,81 @@ def moe_awq_to_marlin_zero_points(
     return output
 
 
+def moe_packed_to_marlin_zero_points(
+    q_zp_packed: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+):
+    """Convert compressed-tensors packed zero points to Marlin format.
+
+    Unlike AWQ, compressed-tensors uses standard bit packing without
+    interleaving, so we just unpack and apply Marlin permutation directly.
+    """
+    num_experts = q_zp_packed.shape[0]
+    output = torch.empty(
+        (num_experts, q_zp_packed.shape[1], q_zp_packed.shape[2]),
+        device=q_zp_packed.device,
+        dtype=q_zp_packed.dtype,
+    )
+    for e in range(num_experts):
+        q_zp = unpack_cols(q_zp_packed[e], num_bits, size_k, size_n)
+        output[e] = marlin_zero_points(q_zp, size_k, size_n, num_bits)
+    return output
+
+
+def moe_row_packed_to_marlin_zero_points(
+    q_zp_packed: torch.Tensor,
+    num_groups: int,
+    size_n: int,
+    num_bits: int,
+):
+    """Convert row-packed (packed_dim=0) zero points to Marlin column-packed format.
+
+    Compressed-tensors pack-quantized checkpoints store zero-points with shape
+    [E, N/pack, K/group] where packing is along N (rows). Marlin expects
+    column-packed format with shape [E, K/group, N/pack]. This function:
+    1. Unpacks rows to get [E, N, K/group]
+    2. Transposes to [E, K/group, N]
+    3. Applies Marlin permutation and repacks to [E, K/group, N/pack]
+
+    Args:
+        q_zp_packed: Input tensor [E, N/pack, K/group] with row-packed INT4
+        num_groups: Number of quantization groups (K/group_size)
+        size_n: Output dimension (N, unpacked)
+        num_bits: Quantization bits (4 or 8)
+    """
+    pack_factor = 32 // num_bits
+    num_experts = q_zp_packed.shape[0]
+    packed_n = q_zp_packed.shape[1]  # N / pack_factor
+
+    # Output shape: [E, num_groups, N/pack]
+    output = torch.empty(
+        (num_experts, num_groups, packed_n),
+        device=q_zp_packed.device,
+        dtype=q_zp_packed.dtype,
+    )
+
+    for e in range(num_experts):
+        # Input: [N/pack, num_groups] with row packing
+        zp = q_zp_packed[e]  # [packed_n, num_groups]
+
+        # Unpack rows: [N/pack, num_groups] -> [N, num_groups]
+        # unpack_cols expects [rows, cols/pack] and unpacks cols
+        # For row unpacking, we transpose, unpack, transpose back
+        zp_t = zp.t()  # [num_groups, packed_n]
+        zp_unpacked_t = unpack_cols(zp_t, num_bits, num_groups, size_n)  # [num_groups, N]
+        zp_unpacked = zp_unpacked_t.t()  # [N, num_groups]
+
+        # Transpose to Marlin layout: [N, num_groups] -> [num_groups, N]
+        zp_transposed = zp_unpacked.t().contiguous()  # [num_groups, N]
+
+        # Apply Marlin permutation and repack columns
+        output[e] = marlin_zero_points(zp_transposed, num_groups, size_n, num_bits)
+
+    return output
+
+
 def maybe_warn_marlin_atomic_add(device, dtype):
     if torch.compiler.is_dynamo_compiling():
         return

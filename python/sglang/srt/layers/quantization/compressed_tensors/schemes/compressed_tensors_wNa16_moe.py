@@ -24,6 +24,8 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_moe_permute_scales,
     moe_awq_to_marlin_zero_points,
+    moe_packed_to_marlin_zero_points,
+    moe_row_packed_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
@@ -68,6 +70,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         quant_config: CompressedTensorsConfig,
         weight_quant: QuantizationArgs,
         num_gpu_experts: int = -1,
+        quant_format: str | None = None,
     ):
         self.quant_config = quant_config
         # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
@@ -80,8 +83,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.actorder = config.actorder
         self.sym = config.symmetric
 
+        # Multi-group checkpoints use "mixed-precision" at the top level;
+        # validate the format of the config group matched for this MoE layer.
+        quant_format = quant_format or self.quant_config.quant_format
         if not (
-            self.quant_config.quant_format == CompressionFormat.pack_quantized.value
+            quant_format == CompressionFormat.pack_quantized.value
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
@@ -191,12 +197,15 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
         # add zero param
+        # Compressed-tensors checkpoints store zero-points with row-packing
+        # (packed_dim=0), so the shape is [E, N/pack, K/group] not [E, K/group, N/pack].
+        # The conversion to Marlin format happens in process_weights_after_loading.
         if not self.sym:
             w13_qzeros = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    num_groups_w13,
                     2 * intermediate_size_per_partition // self.packed_factor,
+                    num_groups_w13,
                     dtype=torch.int32,
                 ),
                 requires_grad=False,
@@ -207,8 +216,8 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             w2_qzeros = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    num_groups_w2,
                     hidden_size // self.packed_factor,
+                    num_groups_w2,
                     dtype=torch.int32,
                 ),
                 requires_grad=False,
@@ -382,20 +391,26 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
 
-        # Repack zero
+        # Repack zero points. Compressed-tensors pack-quantized checkpoints store
+        # zero-points with row packing (packed_dim=0): shape [E, N/pack, K/group].
+        # Convert to Marlin column-packed format: [E, K/group, N/pack].
         if not self.sym:
-            marlin_w13_zp = moe_awq_to_marlin_zero_points(
+            # w13: shape is [E, 2*intermediate/pack, hidden/group]
+            # Output needs [E, hidden/group, 2*intermediate/pack]
+            marlin_w13_zp = moe_row_packed_to_marlin_zero_points(
                 layer.w13_weight_zero_point,
-                size_k=layer.w13_weight_zero_point.shape[1],
-                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_groups=layer.w13_weight_zero_point.shape[2],  # K/group = hidden/group
+                size_n=layer.w13_weight_zero_point.shape[1] * self.packed_factor,  # N = 2*intermediate
                 num_bits=self.num_bits,
             )
             replace_tensor("w13_weight_zero_point", marlin_w13_zp)
 
-            marlin_w2_zp = moe_awq_to_marlin_zero_points(
+            # w2: shape is [E, hidden/pack, intermediate/group]
+            # Output needs [E, intermediate/group, hidden/pack]
+            marlin_w2_zp = moe_row_packed_to_marlin_zero_points(
                 layer.w2_weight_zero_point,
-                size_k=layer.w2_weight_zero_point.shape[1],
-                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_groups=layer.w2_weight_zero_point.shape[2],  # K/group = intermediate/group
+                size_n=layer.w2_weight_zero_point.shape[1] * self.packed_factor,  # N = hidden
                 num_bits=self.num_bits,
             )
             replace_tensor("w2_weight_zero_point", marlin_w2_zp)
@@ -530,6 +545,22 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         w2_scale = w2_scale.transpose(1, 2).contiguous()
         layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
 
+        # Convert asymmetric zero-points.  compressed-tensors packs them along
+        # the output dim (packed_dim=0), so the checkpoint layout is already
+        # N-major: [E, N//8, K//group_size] int32.  The Triton kernel indexes
+        # them as uint8 with two 4-bit values per byte along N
+        # (b_zp >> ((n % 2) * 4)) & 0xF, i.e. [E, N//2, K//group_size], so the
+        # only work needed is an int32->uint8 reinterpret on the N axis.  No
+        # Marlin-style permutation or interleave applies here.
+        if not self.sym:
+            for name in ("w13_weight_zero_point", "w2_weight_zero_point"):
+                zp = getattr(layer, name).data
+                # [E, N//8, G] int32 -> [E, G, N//8] -> uint8 [E, G, N//2]
+                zp = zp.transpose(1, 2).contiguous().view(torch.uint8)
+                # -> [E, N//2, G], matching stride_bzn / stride_bzk
+                zp = zp.transpose(1, 2).contiguous()
+                setattr(layer, name, torch.nn.Parameter(zp, requires_grad=False))
+
         layer.is_triton_converted = True
 
     def create_moe_runner(
@@ -547,6 +578,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             use_int4_w4a16=True,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+            w13_zp=None if self.sym else layer.w13_weight_zero_point,
+            w2_zp=None if self.sym else layer.w2_weight_zero_point,
             block_shape=[0, self.group_size],
         )
 

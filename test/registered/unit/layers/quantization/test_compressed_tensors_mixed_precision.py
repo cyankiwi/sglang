@@ -219,6 +219,27 @@ class TestMixedPrecisionFormat(CustomTestCase):
 
         self.assertIsInstance(scheme, CompressedTensorsW8A8Fp8)
 
+    def test_moe_scheme_uses_per_group_format(self):
+        # The WNA16 MoE constructor must validate the matched group's format,
+        # not the top-level "mixed-precision" marker.
+        wna16_moe_group = dict(WNA16_GROUP)
+        wna16_moe_group["targets"] = ["re:.*mlp\\.experts.*"]
+        config = _mixed_precision_config(wna16_moe_group, FP8_GROUP)
+        quant_config = CompressedTensorsConfig.from_config(config)
+
+        with mock.patch.object(
+            compressed_tensors,
+            "get_moe_runner_backend",
+            return_value=MoeRunnerBackend.MARLIN,
+        ):
+            scheme = quant_config.get_moe_scheme(
+                torch.nn.Module(), layer_name=EXPERTS_LAYER
+            )
+
+        self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
+        self.assertEqual(scheme.num_bits, 4)
+        self.assertEqual(scheme.group_size, 128)
+
 
 if __name__ == "__main__":
     unittest.main()

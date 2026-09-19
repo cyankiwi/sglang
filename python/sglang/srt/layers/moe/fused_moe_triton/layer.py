@@ -1193,6 +1193,9 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
 
+        # Compressed-tensors weights and scales need transposing from [N, K] to [K, N].
+        # Zero-points are handled separately in process_weights_after_loading
+        # because they need unpack->transpose->repack, not simple transpose.
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -1234,7 +1237,11 @@ class FusedMoE(torch.nn.Module):
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
         if self.use_triton_kernels:
             is_transposed = True
-        if is_transposed:
+        # Zero-points are not transposed at load time (skipped above), so
+        # do not flip shard_dim for them. The checkpoint's zero_point shape
+        # is [N_packed, K_groups] and we shard the K (group) dimension.
+        is_zero_point = "zero" in weight_name
+        if is_transposed and not is_zero_point:
             shard_dim = int(not shard_dim)
 
         if self._maybe_load_fp8_shared_expert_as_fp4(
@@ -1447,6 +1454,9 @@ class FusedMoE(torch.nn.Module):
             )
 
             clear_mxfp8_shuffle_index_cache()
+        # Compressed-tensors weights and scales need transposing from [N, K] to [K, N].
+        # Zero-points are handled separately in process_weights_after_loading
+        # because they need unpack->transpose->repack, not simple transpose.
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (

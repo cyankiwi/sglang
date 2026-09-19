@@ -616,7 +616,12 @@ class CompressedTensorsConfig(QuantizationConfig):
             and weight_quant.type == QuantizationType.INT
             and weight_quant.strategy == QuantizationStrategy.GROUP.value
             and weight_quant.group_size in (32, 128)
-            and weight_quant.symmetric
+            # Asymmetric (packed zero-point) checkpoints are supported: the
+            # Triton kernel consumes zero-points natively as uint8 nibbles in
+            # [E, N//2, K//group], which is the layout compressed-tensors
+            # already stores (packed_dim=0).  The Marlin MoE has_zp path is
+            # NOT usable here -- it mis-dequantizes even when the zero-point
+            # is a constant that makes it identical to the symmetric case.
             and not weight_quant.actorder
         )
 
@@ -818,6 +823,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+        scheme_format = scheme_dict.get("format")
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
@@ -832,7 +838,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(
-                        self, weight_quant=weight_quant
+                        self,
+                        weight_quant=weight_quant,
+                        quant_format=scheme_format,
                     )
                 else:
                     moe_backend = get_moe_runner_backend()
@@ -844,24 +852,40 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
                     if moe_backend.is_triton() and not triton_supported:
                         raise ValueError(
-                            "The Triton WNA16 MoE backend only supports symmetric "
-                            "INT4 group quantization with group_size=32 or 128 and no "
-                            "actorder."
+                            "The Triton WNA16 MoE backend only supports INT4 group "
+                            "quantization with group_size=32 or 128 and no actorder."
                         )
-                    if moe_backend.is_triton() or use_blackwell_triton:
+                    # Marlin cannot serve asymmetric (zero-point) WNA16 MoE
+                    # correctly, so prefer Triton whenever zero-points exist.
+                    use_asym_triton = (
+                        moe_backend.is_auto()
+                        and triton_supported
+                        and not weight_quant.symmetric
+                    )
+                    if moe_backend.is_triton() or use_blackwell_triton or use_asym_triton:
                         reason = (
                             "SM100/SM103 auto default"
                             if use_blackwell_triton
-                            else "moe_runner_backend=triton"
+                            else (
+                                "asymmetric INT4 (Marlin has_zp is unsupported)"
+                                if use_asym_triton
+                                else "moe_runner_backend=triton"
+                            )
                         )
                         logger.info_once(
                             f"Using CompressedTensorsWNA16TritonMoE ({reason})"
                         )
                         return CompressedTensorsWNA16TritonMoE(
-                            self, weight_quant=weight_quant
+                            self,
+                            weight_quant=weight_quant,
+                            quant_format=scheme_format,
                         )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                    return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
+                    return CompressedTensorsWNA16MoE(
+                        self,
+                        weight_quant=weight_quant,
+                        quant_format=scheme_format,
+                    )
             else:
                 if (
                     self._is_dynamic_token_w4(weight_quant, input_quant)

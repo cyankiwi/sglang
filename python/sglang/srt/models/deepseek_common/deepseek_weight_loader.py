@@ -20,6 +20,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
+from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+from compressed_tensors.quantization.lifecycle.forward import dequantize
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -596,6 +598,36 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+                # compressed-tensors WNA16 stores the absorbed MLA projection
+                # packed, but this post-load path needs a dense local TP shard
+                # in order to split it into w_kc and w_vc.
+                kv_b_proj = self_attn.kv_b_proj
+                scheme = kv_b_proj.scheme
+                num_bits = 32 // scheme.pack_factor
+                local_shape = torch.Size(
+                    (kv_b_proj.weight_scale.shape[0], kv_b_proj.weight_shape[1].item())
+                )
+                unpacked_weight = unpack_from_int32(
+                    kv_b_proj.weight_packed,
+                    num_bits,
+                    local_shape,
+                )
+                zero_point = getattr(kv_b_proj, "weight_zero_point", None)
+                if zero_point is not None:
+                    zero_point = unpack_from_int32(
+                        zero_point,
+                        num_bits,
+                        torch.Size((local_shape[0], kv_b_proj.weight_scale.shape[-1])),
+                        packed_dim=0,
+                    )
+                w = dequantize(
+                    x_q=unpacked_weight,
+                    scale=kv_b_proj.weight_scale,
+                    zero_point=zero_point,
+                    g_idx=getattr(kv_b_proj, "weight_g_idx", None),
+                    dtype=torch.bfloat16,
+                )
             else:
                 w = self_attn.kv_b_proj.weight
 

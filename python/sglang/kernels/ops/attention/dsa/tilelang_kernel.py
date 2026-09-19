@@ -417,9 +417,16 @@ def sparse_attention_fwd_kernel_v1(
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
 
-            # Rescale
+            # Rescale.  A row whose indices are entirely padding (-1) selects
+            # no KV at all, so sumexp stays 0 and acc_o stays 0; the plain
+            # division would make that row 0/0 = NaN, which then propagates
+            # through the residual stream and destroys the whole forward pass.
+            # Any row with at least one valid index has sumexp >= 1, because
+            # the running-max element contributes exp2(0) = 1, so clamping the
+            # denominator cannot perturb a real row and makes a fully padded
+            # row read out as 0.
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] /= T.max(sumexp[h_i], T.Cast(accum_dtype, 1e-30))
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
@@ -1393,7 +1400,21 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        kernel_kwargs = {}
+        if (
+            tail_dim == 0
+            and d_v == 512
+            and num_heads == 32
+            and torch.cuda.get_device_capability(q.device)[0] == 12
+        ):
+            # GLM5Next TP2 on SM120/SM121: the default two-stage kernel
+            # requests 169984 bytes of shared memory, above the device limit.
+            # Use a single-stage 32-token tile; 128 threads keeps the GEMM
+            # and softmax fragment layouts compatible for 32 query heads.
+            kernel_kwargs = dict(block_I=32, num_stages=1, threads=128)
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **kernel_kwargs
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 

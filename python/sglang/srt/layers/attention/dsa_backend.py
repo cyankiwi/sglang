@@ -17,6 +17,7 @@ import torch
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -290,6 +291,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "triton",
+    "triton_mla_sparse",
     "trtllm",
     "intel_xpu",
 ]
@@ -439,6 +441,8 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        if "triton_mla_sparse" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            self._init_triton_mla_sparse(model_runner)
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -550,6 +554,50 @@ class DeepseekSparseAttnBackend(
         else:
             self.workspace_buffer = None
             self._multi_ctas_kv_counter_buffer = None
+
+    def _init_triton_mla_sparse(self, model_runner: ModelRunner) -> None:
+        """Runtime guard, also covering runners constructed outside CLI resolution."""
+        if not is_cuda() or _is_hip or self.device_sm_major != 12:
+            raise ValueError("triton_mla_sparse requires NVIDIA CUDA SM12x.")
+        if (
+            self.kv_cache_dtype != torch.bfloat16
+            or self.dsa_kv_cache_store_fp8
+            or model_runner.model_config.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "triton_mla_sparse requires BF16 activations and KV cache."
+            )
+        if self.kv_lora_rank != 512 or self.qk_rope_head_dim not in (0, 64):
+            raise ValueError(
+                "triton_mla_sparse requires kv_lora_rank=512 and RoPE width 0 or 64."
+            )
+        if model_runner.model_config.has_attention_sinks:
+            raise ValueError("triton_mla_sparse does not support attention sinks.")
+        if self.hisparse_coordinator is not None:
+            raise ValueError("triton_mla_sparse does not support HiSparse.")
+        parallel = get_parallel()
+        if (
+            parallel.dcp_size != 1
+            or parallel.attn_cp_size != 1
+            or parallel.enable_prefill_cp
+        ):
+            raise ValueError(
+                "triton_mla_sparse does not support DCP or prefill context parallelism."
+            )
+        if get_spec().speculative_algorithm is not None or self.speculative_num_steps:
+            raise ValueError(
+                "triton_mla_sparse does not yet support speculative decoding."
+            )
+        if get_disagg().disaggregation_mode != "null":
+            raise ValueError(
+                "triton_mla_sparse does not yet support PD disaggregation."
+            )
+        # Never query device properties (or tensor values) on the forward/capture
+        # path. The runner's eager warmups must autotune each kernel specialization
+        # before CUDA graph capture.
+        self._triton_mla_sparse_sm_count = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -2013,6 +2061,16 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "triton_mla_sparse":
+            return self._forward_triton_mla_sparse(
+                q_all=q_all,
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -2317,6 +2375,16 @@ class DeepseekSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "triton_mla_sparse":
+            return self._forward_triton_mla_sparse(
+                q_all=q_all,
+                q_nope=q_nope,
+                q_rope=q_rope,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
@@ -2987,6 +3055,85 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+        )
+
+    def _forward_triton_mla_sparse(
+        self,
+        q_all: torch.Tensor | None,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Consume SGLang's physical slot table, without a second index mapping."""
+        q = q_all if q_all is not None else q_nope
+        if not is_cuda() or _is_hip or self.device_sm_major != 12 or not q.is_cuda:
+            raise ValueError("triton_mla_sparse requires CUDA SM12x tensors.")
+        if v_head_dim != 512:
+            raise ValueError("triton_mla_sparse requires absorbed v_head_dim=512.")
+        if q.ndim != 3 or kv_cache.ndim != 3:
+            raise ValueError(
+                "triton_mla_sparse requires three-dimensional Q and KV tensors."
+            )
+        if q_all is None and (
+            q_nope.ndim != 3
+            or q_nope.shape[-1] != 512
+            or q_rope.ndim != 3
+            or q_rope.shape[:2] != q_nope.shape[:2]
+            or q_rope.shape[-1] not in (0, 64)
+        ):
+            raise ValueError(
+                "triton_mla_sparse requires Q NoPE [T,H,512] and RoPE [T,H,0 or 64]."
+            )
+        q_parts = (q_all,) if q_all is not None else (q_nope, q_rope)
+        for tensor in (*q_parts, kv_cache):
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError("triton_mla_sparse requires BF16 Q and KV tensors.")
+            if tensor.device != q.device or tensor.stride(-1) != 1:
+                raise ValueError(
+                    "triton_mla_sparse requires same-device Q/KV with contiguous last dimensions."
+                )
+        q_width = q.shape[-1] + (q_rope.shape[-1] if q_all is None else 0)
+        if (
+            q.shape[1] < 1
+            or q_width not in (512, 576)
+            or kv_cache.shape[1:] != (1, q_width)
+        ):
+            raise ValueError(
+                "triton_mla_sparse requires Q [T,H,512 or 576] and KV [slots,1,sameD]."
+            )
+        if (
+            page_table_1.ndim != 2
+            or page_table_1.shape[0] != q.shape[0]
+            or page_table_1.dtype not in (torch.int32, torch.int64)
+            or page_table_1.device != q.device
+        ):
+            raise ValueError(
+                "triton_mla_sparse requires same-device physical indices [T,K] in int32/int64."
+            )
+
+        if q_all is None and q_rope.shape[-1] != 0:
+            q = concat_mla_absorb_q_general(q_nope, q_rope)
+        # Preserve every live KPool tail slot (e.g. 2051 -> 2064, NOT 2048).
+        padding = (-page_table_1.shape[-1]) % 16
+        if padding:
+            page_table_1 = torch.nn.functional.pad(page_table_1, (0, padding), value=-1)
+        elif page_table_1.stride(-1) != 1:
+            page_table_1 = page_table_1.contiguous()
+
+        from sglang.kernels.ops.attention.dsa.triton_mla_sparse import (
+            triton_mla_sparse_attention,
+        )
+
+        return triton_mla_sparse_attention(
+            q=q,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            num_kv_splits=self.num_splits or None,
+            sm_count=self._triton_mla_sparse_sm_count,
         )
 
     def _forward_triton_decode(

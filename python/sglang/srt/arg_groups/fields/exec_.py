@@ -193,7 +193,7 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. triton_mla_sparse is opt-in, CUDA SM12x only, and requires BF16 activations and explicit --kv-cache-dtype bfloat16.",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -203,6 +203,7 @@ class ExecKernel(msgspec.Struct):
                 "fa3",
                 "tilelang",
                 "triton",
+                "triton_mla_sparse",
                 "aiter",
                 "trtllm",
             ],
@@ -223,7 +224,7 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. triton_mla_sparse is opt-in, CUDA SM12x only, and requires BF16 activations and explicit --kv-cache-dtype bfloat16.",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -233,6 +234,7 @@ class ExecKernel(msgspec.Struct):
                 "fa3",
                 "tilelang",
                 "triton",
+                "triton_mla_sparse",
                 "aiter",
                 "trtllm",
             ],

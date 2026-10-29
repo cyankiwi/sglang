@@ -551,12 +551,60 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     return declared
 
 
+def _check_triton_mla_sparse_config(view: Any) -> None:
+    """Validate the explicit BF16/SM12x port before any DSA defaults or fallbacks."""
+    if "triton_mla_sparse" not in (
+        view.dsa_prefill_backend,
+        view.dsa_decode_backend,
+    ):
+        return
+
+    import torch
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if not get_platform().is_cuda or get_platform().is_hip:
+        raise ValueError("triton_mla_sparse requires NVIDIA CUDA SM12x (not ROCm/HIP).")
+    if torch.cuda.get_device_capability()[0] != 12:
+        raise ValueError("triton_mla_sparse requires CUDA SM12x.")
+    if view.kv_cache_dtype not in ("bf16", "bfloat16"):
+        raise ValueError(
+            "triton_mla_sparse requires explicit --kv-cache-dtype bfloat16; "
+            "auto and FP8 caches are not supported."
+        )
+    model_config = model_config_of(view)
+    if not is_deepseek_dsa(model_config.hf_config):
+        raise ValueError("triton_mla_sparse requires a DSA model.")
+    if model_config.dtype != torch.bfloat16:
+        raise ValueError(
+            "triton_mla_sparse requires BF16 activations (--dtype bfloat16)."
+        )
+    # This is the absorbed MLA output width, NOT the original v_head_dim (256
+    # for GLM5Next). The latter is produced by the subsequent value projection.
+    if model_config.kv_lora_rank != 512 or model_config.qk_rope_head_dim not in (0, 64):
+        raise ValueError(
+            "triton_mla_sparse requires kv_lora_rank=512 and RoPE width 0 or 64."
+        )
+    if model_config.has_attention_sinks:
+        raise ValueError("triton_mla_sparse does not support attention sinks.")
+    if view.enable_hisparse:
+        raise ValueError("triton_mla_sparse does not support HiSparse.")
+    if view.dcp_size != 1 or view.attn_cp_size != 1 or view.enable_prefill_cp:
+        raise ValueError(
+            "triton_mla_sparse does not support DCP or prefill context parallelism."
+        )
+    if view.speculative_algorithm is not None:
+        raise ValueError("triton_mla_sparse does not yet support speculative decoding.")
+    if view.disaggregation_mode != "null":
+        raise ValueError("triton_mla_sparse does not yet support PD disaggregation.")
+
+
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Slot pass in the DSA arm, ordered before the split-backend
     resolution: default the kv-cache dtype from the device capability
     (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
     PRISTINE dsa split backends (their resolution runs after this pass)."""
+    _check_triton_mla_sparse_config(view)
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -624,6 +672,16 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    if "triton_mla_sparse" in chosen:
+        if hip:
+            raise ValueError(
+                "triton_mla_sparse requires NVIDIA CUDA SM12x (not ROCm/HIP)."
+            )
+        if kv_cache_dtype not in ("bf16", "bfloat16"):
+            raise ValueError(
+                "triton_mla_sparse requires explicit --kv-cache-dtype bfloat16."
+            )
+
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
         raise ValueError(
@@ -661,6 +719,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
     backends from the mid-resolution kv-cache dtype and the device
     capability. The hisparse arm takes precedence under --enable-hisparse."""
+    _check_triton_mla_sparse_config(view)
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
